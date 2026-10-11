@@ -28,6 +28,24 @@ fn main() -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&registry)?);
     }
     registry.write_atomic(&output)?;
+    // Start each boot's chain with what was protected, before any tool runs
+    let devices: Vec<serde_json::Value> = registry
+        .devices
+        .iter()
+        .map(
+            |d| serde_json::json!({ "role": d.role, "identity": d.identity, "reasons": d.reasons }),
+        )
+        .collect();
+    let event = dfcore::audit::Event::new(
+        "dfcore-protect",
+        env!("CARGO_PKG_VERSION"),
+        "protected_registry",
+    )
+    .detail("registry", output.to_string_lossy().to_string())
+    .detail("devices", devices);
+    if let Err(e) = dfcore::audit::append(event) {
+        eprintln!("[dfcore] WARNING: audit log not written: {e:#}");
+    }
     for d in &registry.devices {
         eprintln!(
             "[dfcore] protected {:?}: {} ({})",
