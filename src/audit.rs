@@ -71,6 +71,40 @@ pub struct Event {
     pub message: Option<String>,
     pub device: Option<DeviceIdentity>,
     pub details: Map<String, Value>,
+    /// Command-line flags whose values are secrets and must not reach the log
+    pub redact: Vec<String>,
+}
+
+pub const REDACTED: &str = "<redacted>";
+
+/// The command line with the values of `flags` replaced, in all forms clap
+/// accepts: `--flag value`, `--flag=value` and, for short flags, `-fvalue`.
+pub fn redact_args(args: impl IntoIterator<Item = String>, flags: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut hide_next = false;
+    for arg in args {
+        if hide_next {
+            out.push(REDACTED.to_string());
+            hide_next = false;
+            continue;
+        }
+        let mut replaced = None;
+        for flag in flags {
+            if arg == *flag {
+                hide_next = true;
+            } else if arg.starts_with(&format!("{flag}=")) {
+                replaced = Some(format!("{flag}={REDACTED}"));
+            } else if flag.len() == 2
+                && !flag.starts_with("--")
+                && arg.starts_with(flag.as_str())
+                && !arg.starts_with("--")
+            {
+                replaced = Some(format!("{flag}{REDACTED}"));
+            }
+        }
+        out.push(replaced.unwrap_or(arg));
+    }
+    out
 }
 
 impl Event {
@@ -83,7 +117,14 @@ impl Event {
             message: None,
             device: None,
             details: Map::new(),
+            redact: Vec::new(),
         }
+    }
+
+    /// Hide the values of these command-line flags in the recorded argv.
+    pub fn redact(mut self, flags: &[&str]) -> Self {
+        self.redact.extend(flags.iter().map(|f| f.to_string()));
+        self
     }
 
     pub fn device(mut self, identity: DeviceIdentity) -> Self {
@@ -243,7 +284,7 @@ pub fn append_to(path: &Path, event: Event) -> Result<Record> {
         tool: event.tool,
         tool_version: event.tool_version,
         uid: host::uid(),
-        argv: std::env::args().collect(),
+        argv: redact_args(std::env::args(), &event.redact),
         action: event.action,
         outcome: event.outcome,
         message: event.message,
@@ -451,6 +492,53 @@ mod tests {
             .unwrap()
             .starts_with(&state.head));
         let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
+    #[test]
+    fn secrets_in_argv_are_redacted_in_every_form() {
+        let flags = vec!["--password".to_string(), "-p".to_string()];
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            redact_args(
+                args(&[
+                    "dfnet",
+                    "hotspot",
+                    "start",
+                    "--password",
+                    "s3cret",
+                    "--ssid",
+                    "AP"
+                ]),
+                &flags
+            ),
+            args(&[
+                "dfnet",
+                "hotspot",
+                "start",
+                "--password",
+                REDACTED,
+                "--ssid",
+                "AP"
+            ])
+        );
+        assert_eq!(
+            redact_args(
+                args(&["dfnet", "--password=s3cret", "-ps3cret", "-p", "s3cret"]),
+                &flags
+            ),
+            args(&[
+                "dfnet",
+                "--password=<redacted>",
+                "-p<redacted>",
+                "-p",
+                REDACTED
+            ])
+        );
+        // Unrelated flags and values are kept
+        assert_eq!(
+            redact_args(args(&["dfnet", "--port", "9999", "--passive"]), &flags),
+            args(&["dfnet", "--port", "9999", "--passive"])
+        );
     }
 
     #[test]
