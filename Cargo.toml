@@ -1,0 +1,19 @@
+[package]
+name = "dfcore"
+version = "0.1.0"
+edition = "2021"
+authors = ["tylerstyle <tylerstyle@users.noreply.github.com>"]
+description = "Shared forensic safety core for dfnix tools: block device topology, protected-device registry and tamper-evident audit log"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tylerstyle/dfcore"
+homepage = "https://github.com/tylerstyle/dfcore"
+readme = "README.md"
+keywords = ["forensics", "dfir", "write-blocker", "audit"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1.0"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
