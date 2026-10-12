@@ -1,0 +1,142 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Verify Tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Check tag matches Cargo.toml and package.nix versions
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(sed -n -E 's/^version = "([^"]+)"$/\1/p' Cargo.toml | head -n1)
+          NIX_VERSION=$(sed -n -E 's/^ *version = "([^"]+)";$/\1/p' package.nix | head -n1)
+          echo "tag=$VERSION Cargo.toml=$CARGO_VERSION package.nix=$NIX_VERSION"
+          if [ "$VERSION" != "$CARGO_VERSION" ] || [ "$VERSION" != "$NIX_VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml ($CARGO_VERSION) and package.nix ($NIX_VERSION)"
+            exit 1
+          fi
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run unit tests
+        run: cargo test --locked --verbose
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [verify]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+
+  update-nur:
+    name: Update NUR Package
+    needs: [publish-release]
+    runs-on: ubuntu-latest
+    env:
+      NUR_UPDATE_TOKEN: ${{ secrets.NUR_UPDATE_TOKEN }}
+    steps:
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Calculate release hashes
+        id: hashes
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          TARBALL_URL="https://github.com/tylerstyle/dfcore/archive/refs/tags/${TAG}.tar.gz"
+
+          echo "Prefetching source hash for $TARBALL_URL..."
+          SRC_PREFETCH=$(nix-prefetch-url --unpack "$TARBALL_URL")
+          SRC_HASH=$(nix hash convert --to sri "sha256:$SRC_PREFETCH")
+
+          echo "Calculating cargo vendor hash..."
+          BUILD_LOG=$(mktemp)
+          nix-build -I nixpkgs=channel:nixos-unstable --expr "
+            with import <nixpkgs> {};
+            rustPlatform.fetchCargoVendor {
+              src = fetchFromGitHub {
+                owner = \"tylerstyle\";
+                repo = \"dfcore\";
+                tag = \"$TAG\";
+                hash = \"$SRC_HASH\";
+              };
+              hash = lib.fakeHash;
+            }
+          " > "$BUILD_LOG" 2>&1 || true
+          cat "$BUILD_LOG"
+          CARGO_HASH=$(grep "got:" "$BUILD_LOG" | tail -n1 | awk '{print $2}')
+
+          if [ -z "$CARGO_HASH" ]; then
+            echo "Failed to calculate cargoHash"
+            exit 1
+          fi
+          {
+            echo "version=$VERSION"
+            echo "src_hash=$SRC_HASH"
+            echo "cargo_hash=$CARGO_HASH"
+          } >> "$GITHUB_OUTPUT"
+          echo "Computed: version=$VERSION, src_hash=$SRC_HASH, cargo_hash=$CARGO_HASH"
+
+      - name: Update NUR derivation, build it and push
+        run: |
+          if [ -z "$NUR_UPDATE_TOKEN" ]; then
+            echo "::warning::NUR_UPDATE_TOKEN secret is not set. Skipping automatic update to tylerstyle/nur-packages."
+            exit 0
+          fi
+
+          git clone "https://x-access-token:${NUR_UPDATE_TOKEN}@github.com/tylerstyle/nur-packages.git" nur-packages
+          cd nur-packages
+          TARGET_FILE="pkgs/dfcore/default.nix"
+          VERSION="${{ steps.hashes.outputs.version }}"
+          SRC_HASH="${{ steps.hashes.outputs.src_hash }}"
+          CARGO_HASH="${{ steps.hashes.outputs.cargo_hash }}"
+
+          # Only the standalone dfcore package; dfdisk pins its own dfcore
+          # revision from its flake.lock in its own release workflow
+          sed -i -E "s/version = \"[^\"]+\";/version = \"$VERSION\";/" "$TARGET_FILE"
+          sed -i -E "/repo = \"dfcore\";/,/hash = /s|hash = \"sha256-[^\"]+\";|hash = \"$SRC_HASH\";|" "$TARGET_FILE"
+          sed -i -E "s|cargoHash = \"sha256-[^\"]+\";|cargoHash = \"$CARGO_HASH\";|" "$TARGET_FILE"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet "$TARGET_FILE"; then
+            echo "No changes detected in NUR derivation."
+            exit 0
+          fi
+
+          # Never push a derivation that does not build
+          nix-build -A dfcore --no-out-link
+
+          git add "$TARGET_FILE"
+          git commit -m "feat(dfcore): bump to v$VERSION with updated source and cargo hashes"
+          git push origin main
+          echo "Successfully committed and pushed NUR update for v$VERSION"
+
+          # Notify upstream NUR index to trigger webhook re-evaluation
+          curl -s -XPOST "https://nur-update.nix-community.org/update?repo=tylerstyle" || true
