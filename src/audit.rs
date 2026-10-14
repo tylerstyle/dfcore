@@ -13,6 +13,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -25,6 +26,8 @@ pub const DEFAULT_PATH: &str = "/run/dfnix/audit.jsonl";
 pub const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Log location; `DFNIX_AUDIT_LOG` overrides it (tests, or a log on the case drive).
+/// Records of a redirected log are not mirrored into the journal unless
+/// `DFNIX_AUDIT_JOURNAL=1`.
 pub fn path() -> PathBuf {
     std::env::var_os("DFNIX_AUDIT_LOG")
         .map(PathBuf::from)
@@ -297,13 +300,35 @@ pub fn append_to(path: &Path, event: Event) -> Result<Record> {
     let line = serde_json::to_string(&record)?;
     file.write_all(format!("{line}\n").as_bytes())?;
     file.sync_all().context("Cannot sync audit log")?;
-    send_to_journal(&record, &line);
+    if journal_mirror(
+        path,
+        std::env::var_os("DFNIX_AUDIT_LOG").as_deref(),
+        std::env::var_os("DFNIX_AUDIT_JOURNAL").as_deref(),
+    ) {
+        send_to_journal(&record, &line);
+    }
     Ok(record)
 }
 
 /// Append to the default log.
 pub fn append(event: Event) -> Result<Record> {
     append_to(&path(), event)
+}
+
+/// Whether an append to `log` is mirrored into the systemd journal, given the
+/// values of `DFNIX_AUDIT_LOG` and `DFNIX_AUDIT_JOURNAL`.
+///
+/// The journal belongs to the host. A log redirected with `DFNIX_AUDIT_LOG`, or
+/// appended to at any other path than the system log, is a test or scratch log
+/// whose records must not show up among the host's own (test suites of the
+/// tools did exactly that). So only the system log is mirrored by default;
+/// `DFNIX_AUDIT_JOURNAL=1` mirrors any log and `DFNIX_AUDIT_JOURNAL=0` none.
+fn journal_mirror(log: &Path, audit_log_env: Option<&OsStr>, journal_env: Option<&OsStr>) -> bool {
+    match journal_env.and_then(OsStr::to_str) {
+        Some("0") => false,
+        Some("1") => true,
+        _ => audit_log_env.is_none() && log == Path::new(DEFAULT_PATH),
+    }
 }
 
 /// Mirror a record into the systemd journal (native protocol). Best effort: the
@@ -539,6 +564,30 @@ mod tests {
             redact_args(args(&["dfnet", "--port", "9999", "--passive"]), &flags),
             args(&["dfnet", "--port", "9999", "--passive"])
         );
+    }
+
+    #[test]
+    fn only_the_system_log_is_mirrored_into_the_journal_by_default() {
+        let system = Path::new(DEFAULT_PATH);
+        let scratch = Path::new("/tmp/dfdisk-test/audit.jsonl");
+        let env = |v: &'static str| Some(OsStr::new(v));
+        assert!(journal_mirror(system, None, None));
+        // Redirected by DFNIX_AUDIT_LOG (test suites), or another path
+        assert!(!journal_mirror(
+            scratch,
+            env("/tmp/dfdisk-test/audit.jsonl"),
+            None
+        ));
+        assert!(!journal_mirror(system, env(DEFAULT_PATH), None));
+        assert!(!journal_mirror(scratch, None, None));
+        // DFNIX_AUDIT_JOURNAL=1 forces the mirror, =0 disables it always
+        assert!(journal_mirror(scratch, env("/tmp/x"), env("1")));
+        assert!(journal_mirror(scratch, None, env("1")));
+        assert!(!journal_mirror(system, None, env("0")));
+        assert!(!journal_mirror(scratch, env("/tmp/x"), env("0")));
+        // Anything else leaves the default
+        assert!(journal_mirror(system, None, env("yes")));
+        assert!(!journal_mirror(scratch, env("/tmp/x"), env("")));
     }
 
     #[test]
