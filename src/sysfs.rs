@@ -14,6 +14,12 @@ use crate::Refusal;
 /// A block device as the kernel numbers it.
 pub type DevNum = (u32, u32);
 
+/// `major:minor` as sysfs and lsblk write it.
+pub fn parse_dev_num(s: &str) -> Option<DevNum> {
+    let (maj, min) = s.trim().split_once(':')?;
+    Some((maj.parse().ok()?, min.parse().ok()?))
+}
+
 /// Read-only view of `/sys/class/block`, rooted elsewhere in tests.
 pub struct BlockTopology {
     class_block: PathBuf,
@@ -44,6 +50,65 @@ impl BlockTopology {
                     .unwrap_or(false)
             })
             .map(|e| e.file_name().to_string_lossy().into_owned())
+    }
+
+    /// Directory of a kernel name; `None` for anything that is not a single path
+    /// component, so a name never reaches outside the block class.
+    fn node(&self, kname: &str) -> Option<PathBuf> {
+        let valid = !kname.is_empty() && kname != "." && kname != ".." && !kname.contains('/');
+        valid.then(|| self.class_block.join(kname))
+    }
+
+    fn attr(&self, kname: &str, attr: &str) -> Option<String> {
+        fs::read_to_string(self.node(kname)?.join(attr))
+            .ok()
+            .map(|s| s.trim().to_string())
+    }
+
+    /// Device number of a kernel name.
+    pub fn dev_of(&self, kname: &str) -> Option<DevNum> {
+        parse_dev_num(&self.attr(kname, "dev")?)
+    }
+
+    /// The kernel's sequence number of the disk (Linux 5.15+). Unlike major:minor
+    /// it is never reused within a boot: a disk attached in place of another under
+    /// the same node, or a loop device bound to a new file, gets a new one.
+    /// Partitions report their disk's.
+    pub fn diskseq(&self, kname: &str) -> Option<u64> {
+        if let Some(seq) = self.attr(kname, "diskseq") {
+            return seq.parse().ok();
+        }
+        let node = self.node(kname)?;
+        if !node.join("partition").exists() {
+            return None;
+        }
+        // /sys/class/block/sdb1 -> .../block/sdb/sdb1
+        let disk = fs::canonicalize(&node).ok()?.parent()?.join("diskseq");
+        fs::read_to_string(disk).ok()?.trim().parse().ok()
+    }
+
+    /// Devices stacked directly on this one (device-mapper, md), sorted.
+    pub fn holders(&self, kname: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .node(kname)
+            .and_then(|n| fs::read_dir(n.join("holders")).ok())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The block layer's read-only flag: `Some(true)` when the kernel refuses
+    /// writes (`blockdev --setro`, write-protect switch, the dfnix udev rule).
+    pub fn read_only(&self, kname: &str) -> Option<bool> {
+        match self.attr(kname, "ro")?.as_str() {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        }
     }
 
     /// Whole physical disks a device ultimately stores its data on: a partition
@@ -101,6 +166,26 @@ impl BlockTopology {
     }
 }
 
+/// Kernel name of a device number on this host.
+pub fn kname_of(dev: DevNum) -> Option<String> {
+    BlockTopology::default().name_of(dev)
+}
+
+/// [`BlockTopology::diskseq`] on this host.
+pub fn diskseq(kname: &str) -> Option<u64> {
+    BlockTopology::default().diskseq(kname)
+}
+
+/// [`BlockTopology::holders`] on this host.
+pub fn holders(kname: &str) -> Vec<String> {
+    BlockTopology::default().holders(kname)
+}
+
+/// [`BlockTopology::read_only`] on this host.
+pub fn read_only(kname: &str) -> Option<bool> {
+    BlockTopology::default().read_only(kname)
+}
+
 /// One line of /proc/self/mountinfo, reduced to what we need.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountEntry {
@@ -139,10 +224,9 @@ pub fn parse_mountinfo(content: &str) -> Vec<MountEntry> {
             let (pre, post) = line.split_once(" - ")?;
             let pre: Vec<&str> = pre.split(' ').collect();
             let post: Vec<&str> = post.split(' ').collect();
-            let (maj, min) = pre.get(2)?.split_once(':')?;
             Some(MountEntry {
                 mount_point: PathBuf::from(unescape_mountinfo(pre.get(4)?)),
-                dev: (maj.parse().ok()?, min.parse().ok()?),
+                dev: parse_dev_num(pre.get(2)?)?,
                 source: unescape_mountinfo(post.get(1)?),
             })
         })
@@ -191,9 +275,11 @@ pub fn backing_device_of_path(_path: &Path) -> Option<DevNum> {
     None
 }
 
-/// Device number of a block device node, or `None` for anything else.
+/// Device number (`st_rdev`) of a block device node, through symlinks such as
+/// `/dev/mapper/x` or `/dev/disk/by-id/…`; `None` for anything that is not a
+/// block device. Only the node's metadata is read, the device is not opened.
 #[cfg(unix)]
-pub fn source_device(path: &Path) -> Option<DevNum> {
+pub fn dev_num_of_path(path: &Path) -> Option<DevNum> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let meta = fs::metadata(path).ok()?;
     if meta.file_type().is_block_device() {
@@ -204,8 +290,13 @@ pub fn source_device(path: &Path) -> Option<DevNum> {
 }
 
 #[cfg(not(unix))]
-pub fn source_device(_path: &Path) -> Option<DevNum> {
+pub fn dev_num_of_path(_path: &Path) -> Option<DevNum> {
     None
+}
+
+/// Same as [`dev_num_of_path`].
+pub fn source_device(path: &Path) -> Option<DevNum> {
+    dev_num_of_path(path)
 }
 
 /// Core of the destination-on-source check, separated from the host for tests.
@@ -263,7 +354,7 @@ pub fn check_disjoint(
 /// partition, or any LVM/RAID/crypt/loop stack on it) as a block-device source.
 /// Regular-file sources are not block devices and are not checked here.
 pub fn ensure_destination_not_on_source(source_path: &str, output_dir: &Path) -> Result<()> {
-    let Some(source) = source_device(Path::new(source_path)) else {
+    let Some(source) = dev_num_of_path(Path::new(source_path)) else {
         return Ok(());
     };
     let dest = backing_device_of_path(output_dir);
@@ -277,16 +368,17 @@ pub fn ensure_destination_not_on_source(source_path: &str, output_dir: &Path) ->
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
 
-    struct FakeSys {
+    /// A `/sys` with `class/block` links into `devices`, as on a real host.
+    pub(crate) struct FakeSys {
         root: PathBuf,
     }
 
     impl FakeSys {
-        fn new(tag: &str) -> Self {
+        pub(crate) fn new(tag: &str) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "dfcore_fake_sysfs_{}_{}",
                 tag,
@@ -298,11 +390,34 @@ mod tests {
             Self { root }
         }
 
-        fn topo(&self) -> BlockTopology {
+        pub(crate) fn topo(&self) -> BlockTopology {
             BlockTopology::new(self.root.join("class/block"))
         }
 
-        fn add(&self, real: &str, name: &str, dev: &str, partition: bool, slaves: &[&str]) {
+        /// Write the attribute file `attr` of the device directory `real`.
+        pub(crate) fn set(&self, real: &str, attr: &str, value: &str) {
+            fs::write(
+                self.root.join("devices").join(real).join(attr),
+                format!("{value}\n"),
+            )
+            .unwrap();
+        }
+
+        /// Record `holder` in the `holders` directory of `real`.
+        pub(crate) fn hold(&self, real: &str, holder: &str) {
+            let dir = self.root.join("devices").join(real).join("holders");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(holder), "").unwrap();
+        }
+
+        pub(crate) fn add(
+            &self,
+            real: &str,
+            name: &str,
+            dev: &str,
+            partition: bool,
+            slaves: &[&str],
+        ) {
             let dir = self.root.join("devices").join(real);
             fs::create_dir_all(dir.join("slaves")).unwrap();
             fs::write(dir.join("dev"), format!("{}\n", dev)).unwrap();
@@ -351,6 +466,64 @@ mod tests {
         assert_eq!(t.backing_disks("md0"), set(&["sdb", "sdc"]));
         assert_eq!(t.name_of((8, 33)).as_deref(), Some("sdc1"));
         assert_eq!(t.name_of((8, 99)), None);
+    }
+
+    #[test]
+    fn device_attributes_are_read_from_sysfs() {
+        let s = FakeSys::lab("attrs");
+        s.set("block/sdb", "diskseq", "12");
+        s.set("block/sdb", "ro", "1");
+        s.set("block/sdc", "ro", "0");
+        s.set("virtual/block/dm-1", "diskseq", "40");
+        s.hold("block/sdc/sdc1", "md0");
+        s.hold("block/sdc/sdc1", "dm-1");
+        let t = s.topo();
+
+        assert_eq!(t.diskseq("sdb"), Some(12));
+        // Partitions carry their disk's sequence number
+        assert_eq!(t.diskseq("sdb2"), Some(12));
+        assert_eq!(t.diskseq("dm-1"), Some(40));
+        assert_eq!(t.diskseq("sdc"), None);
+        assert_eq!(t.diskseq("sdc1"), None);
+        assert_eq!(t.diskseq("nonexistent"), None);
+
+        assert_eq!(t.read_only("sdb"), Some(true));
+        assert_eq!(t.read_only("sdc"), Some(false));
+        assert_eq!(t.read_only("sda"), None);
+
+        assert_eq!(t.holders("sdc1"), ["dm-1", "md0"]);
+        assert!(t.holders("sdb").is_empty());
+
+        assert_eq!(t.dev_of("dm-0"), Some((254, 0)));
+        assert_eq!(t.name_of((254, 1)).as_deref(), Some("dm-1"));
+    }
+
+    #[test]
+    fn kernel_names_cannot_leave_the_block_class() {
+        let s = FakeSys::lab("names");
+        // A file one level up from class/block must not be reachable
+        fs::write(s.root.join("class/ro"), "1\n").unwrap();
+        let t = s.topo();
+        for bad in ["", ".", "..", "../ro", "sdb/../sdc", "/etc"] {
+            assert_eq!(t.read_only(bad), None, "{bad:?}");
+            assert_eq!(t.dev_of(bad), None, "{bad:?}");
+            assert_eq!(t.diskseq(bad), None, "{bad:?}");
+            assert!(t.holders(bad).is_empty(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn device_numbers_parse_and_only_block_nodes_have_one() {
+        assert_eq!(parse_dev_num("259:12\n"), Some((259, 12)));
+        assert_eq!(parse_dev_num("8"), None);
+        assert_eq!(parse_dev_num("a:b"), None);
+        let file = std::env::temp_dir().join(format!("dfcore_devnum_{}", std::process::id()));
+        fs::write(&file, b"x").unwrap();
+        assert_eq!(dev_num_of_path(&file), None);
+        let _ = fs::remove_file(&file);
+        assert_eq!(dev_num_of_path(Path::new("/nonexistent/dfcore/dev")), None);
+        // A character device is not a block device
+        assert_eq!(dev_num_of_path(Path::new("/dev/null")), None);
     }
 
     #[test]

@@ -5,6 +5,8 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 
+use crate::sysfs::{self, BlockTopology, DevNum};
+
 pub const LSBLK_COLUMNS: &str =
     "NAME,PATH,MAJ:MIN,SIZE,RO,TYPE,FSTYPE,LABEL,MOUNTPOINTS,MODEL,SERIAL,WWN";
 
@@ -46,7 +48,25 @@ impl BlockDevice {
         self.dev_type.as_deref() == Some(t)
     }
 
+    /// Device number from the `MAJ:MIN` column.
+    pub fn dev_num(&self) -> Option<DevNum> {
+        sysfs::parse_dev_num(self.maj_min.as_deref()?)
+    }
+
+    /// Identity as lsblk reports it, with the disk sequence number from sysfs.
     pub fn identity(&self) -> DeviceIdentity {
+        self.identity_in(&BlockTopology::default())
+    }
+
+    /// [`identity`](Self::identity) with sysfs read from `topo`.
+    pub fn identity_in(&self, topo: &BlockTopology) -> DeviceIdentity {
+        let mut id = self.lsblk_identity();
+        id.diskseq = self.sysfs_name(topo).and_then(|k| topo.diskseq(&k));
+        id
+    }
+
+    /// What lsblk reports, without looking at sysfs.
+    pub(crate) fn lsblk_identity(&self) -> DeviceIdentity {
         let clean = |v: &Option<String>| {
             v.as_deref()
                 .map(str::trim)
@@ -61,12 +81,24 @@ impl BlockDevice {
             wwn: clean(&self.wwn),
             model: clean(&self.model),
             size: clean(&self.size),
+            diskseq: None,
+        }
+    }
+
+    /// Kernel name in sysfs. lsblk's NAME is the mapper name for device-mapper
+    /// devices (`cryptroot`, not `dm-0`), so the device number decides.
+    fn sysfs_name(&self, topo: &BlockTopology) -> Option<String> {
+        match self.dev_num() {
+            Some(dev) if topo.dev_of(&self.name) == Some(dev) => Some(self.name.clone()),
+            Some(dev) => topo.name_of(dev),
+            None => Some(self.name.clone()),
         }
     }
 }
 
 /// How a device is identified in the registry and in audit records. Serial and
-/// WWN survive re-enumeration; kernel name and major:minor do not.
+/// WWN survive re-enumeration; kernel name and major:minor do not. `diskseq` is
+/// new for every attachment, even of the same disk on the same node.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceIdentity {
     pub path: String,
@@ -81,6 +113,8 @@ pub struct DeviceIdentity {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diskseq: Option<u64>,
 }
 
 impl DeviceIdentity {
@@ -99,6 +133,24 @@ impl DeviceIdentity {
                     && self.maj_min == other.maj_min
             }
         }
+    }
+
+    /// Same device in the same attachment: the same physical device, still
+    /// behind the same major:minor and, where both sides know it, the same disk
+    /// sequence number. False when a disk was swapped in on the node between two
+    /// looks at it, even one that reports no serial. [`same_device`] stays true
+    /// for a re-plugged disk; that is what protection follows.
+    ///
+    /// [`same_device`]: Self::same_device
+    pub fn same_attachment(&self, other: &DeviceIdentity) -> bool {
+        let seq_matches = match (self.diskseq, other.diskseq) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        };
+        self.maj_min.is_some()
+            && self.maj_min == other.maj_min
+            && seq_matches
+            && self.same_device(other)
     }
 }
 
@@ -246,6 +298,7 @@ pub fn roots<'a>(flat: &'a [FlatDevice], path: &str) -> Vec<&'a FlatDevice> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::sysfs::tests::FakeSys;
 
     pub const LAB: &str = r#"{"blockdevices":[
       {"name":"nvme0n1","path":"/dev/nvme0n1","maj:min":"259:0","type":"disk","serial":"S6Z0NJ0W","wwn":"eui.0025384b21406566","model":"Samsung SSD 990","mountpoints":[null],"children":[
@@ -324,7 +377,7 @@ pub(crate) mod tests {
     #[test]
     fn identity_matching() {
         let flat = lab();
-        let nvme = flat[0].device.identity();
+        let nvme = flat[0].device.lsblk_identity();
         assert_eq!(nvme.serial.as_deref(), Some("S6Z0NJ0W"));
         // Same disk re-enumerated under another name and number
         let moved = DeviceIdentity {
@@ -347,7 +400,7 @@ pub(crate) mod tests {
             .find(|f| f.device.name == "sde")
             .unwrap()
             .device
-            .identity();
+            .lsblk_identity();
         assert_eq!(sde.serial, None);
         assert!(sde.same_device(&sde.clone()));
         let renamed = DeviceIdentity {
@@ -355,5 +408,114 @@ pub(crate) mod tests {
             ..sde.clone()
         };
         assert!(!sde.same_device(&renamed));
+    }
+
+    #[test]
+    fn identity_takes_the_disk_sequence_number_from_sysfs() {
+        let s = FakeSys::new("lsblk_identity");
+        s.add("block/nvme0n1", "nvme0n1", "259:0", false, &[]);
+        s.add("block/nvme0n1/nvme0n1p2", "nvme0n1p2", "259:2", true, &[]);
+        s.add("virtual/block/dm-0", "dm-0", "254:0", false, &["nvme0n1p2"]);
+        s.set("block/nvme0n1", "diskseq", "3");
+        s.set("virtual/block/dm-0", "diskseq", "9");
+        // A stale entry with lsblk's name but another device number
+        s.add("block/sdb", "sdb", "8:99", false, &[]);
+        s.set("block/sdb", "diskseq", "77");
+        let topo = s.topo();
+        let flat = lab();
+        let seq = |name: &str| {
+            flat.iter()
+                .find(|f| f.device.name == name)
+                .unwrap()
+                .device
+                .identity_in(&topo)
+                .diskseq
+        };
+        assert_eq!(seq("nvme0n1"), Some(3));
+        assert_eq!(seq("nvme0n1p2"), Some(3));
+        // lsblk names dm-0 "cryptroot"; found by major:minor
+        assert_eq!(seq("cryptroot"), Some(9));
+        assert_eq!(seq("sdb"), None);
+        assert_eq!(seq("sde"), None);
+    }
+
+    #[test]
+    fn disk_sequence_number_is_optional_in_json() {
+        let id = lab()[0].device.lsblk_identity();
+        let json = serde_json::to_string(&id).unwrap();
+        assert!(!json.contains("diskseq"), "{json}");
+        let old: DeviceIdentity = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.diskseq, None);
+        let with = DeviceIdentity {
+            diskseq: Some(7),
+            ..id
+        };
+        let back: DeviceIdentity =
+            serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(back, with);
+    }
+
+    #[test]
+    fn same_attachment_detects_a_disk_swapped_on_the_same_node() {
+        let flat = lab();
+        let id = |name: &str| {
+            flat.iter()
+                .find(|f| f.device.name == name)
+                .unwrap()
+                .device
+                .lsblk_identity()
+        };
+        let selected = DeviceIdentity {
+            diskseq: Some(12),
+            ..id("sdb")
+        };
+        assert_eq!(selected.kernel_name, "sdb");
+        assert!(selected.same_attachment(&selected.clone()));
+        // Re-plugged: same disk, new attachment; still the same device
+        let replugged = DeviceIdentity {
+            diskseq: Some(13),
+            ..selected.clone()
+        };
+        assert!(selected.same_device(&replugged));
+        assert!(!selected.same_attachment(&replugged));
+        // Another disk took over /dev/sdb and 8:16
+        let swapped = DeviceIdentity {
+            serial: Some("WD-OTHER".into()),
+            ..selected.clone()
+        };
+        assert!(!selected.same_attachment(&swapped));
+        // Same disk, but now behind another device number
+        let moved = DeviceIdentity {
+            maj_min: Some("8:32".into()),
+            ..selected.clone()
+        };
+        assert!(!selected.same_attachment(&moved));
+        // An unknown sequence number on one side leaves the other checks
+        let unknown = DeviceIdentity {
+            diskseq: None,
+            ..selected.clone()
+        };
+        assert!(selected.same_attachment(&unknown));
+        // Without major:minor nothing ties the two to one attachment
+        let bare = DeviceIdentity {
+            maj_min: None,
+            ..selected.clone()
+        };
+        assert!(!bare.same_attachment(&bare.clone()));
+        // No serial: a different sequence number is the only tell
+        let sde = DeviceIdentity {
+            diskseq: Some(30),
+            ..id("sde")
+        };
+        assert_eq!(
+            (sde.kernel_name.as_str(), sde.serial.as_deref()),
+            ("sde", None)
+        );
+        let other_stick = DeviceIdentity {
+            diskseq: Some(31),
+            ..sde.clone()
+        };
+        assert!(sde.same_device(&other_stick));
+        assert!(!sde.same_attachment(&other_stick));
     }
 }
