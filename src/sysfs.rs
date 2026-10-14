@@ -350,14 +350,27 @@ pub fn check_disjoint(
     }
 }
 
+/// The nearest existing directory at or above `path`: where a directory that
+/// is yet to be created will be stored.
+pub fn existing_ancestor(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    absolute
+        .ancestors()
+        .find(|p| p.exists())
+        .map(Path::to_path_buf)
+        .unwrap_or(absolute)
+}
+
 /// Refuse when the output directory lives on the same physical disk (any
 /// partition, or any LVM/RAID/crypt/loop stack on it) as a block-device source.
-/// Regular-file sources are not block devices and are not checked here.
+/// Regular-file sources are not block devices and are not checked here. An
+/// output directory that does not exist yet is checked where it would be
+/// created, so the check can run before anything is written.
 pub fn ensure_destination_not_on_source(source_path: &str, output_dir: &Path) -> Result<()> {
     let Some(source) = dev_num_of_path(Path::new(source_path)) else {
         return Ok(());
     };
-    let dest = backing_device_of_path(output_dir);
+    let dest = backing_device_of_path(&existing_ancestor(output_dir));
     check_disjoint(
         &BlockTopology::default(),
         source,
@@ -582,6 +595,20 @@ pub(crate) mod tests {
             assert!(crate::is_refusal(&e), "{e:#}");
             assert!(e.to_string().contains("Cannot resolve"), "{e}");
         }
+    }
+
+    #[test]
+    fn a_missing_output_directory_is_checked_where_it_would_be_created() {
+        let base = std::env::temp_dir().join(format!("dfcore_ancestor_{}", std::process::id()));
+        fs::create_dir_all(&base).unwrap();
+        assert_eq!(existing_ancestor(&base.join("case/sub")), base);
+        assert_eq!(existing_ancestor(&base), base);
+        let _ = fs::remove_dir_all(&base);
+        assert_eq!(
+            existing_ancestor(Path::new("dfcore-no-such-dir/x")),
+            std::env::current_dir().unwrap()
+        );
+        assert_eq!(existing_ancestor(Path::new("/")), PathBuf::from("/"));
     }
 
     #[test]
