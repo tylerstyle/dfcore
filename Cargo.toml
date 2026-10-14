@@ -1,6 +1,6 @@
 [package]
 name = "dfcore"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["tylerstyle <tylerstyle@users.noreply.github.com>"]
 description = "Shared forensic safety core for dfnix tools: block device topology, protected-device registry and tamper-evident audit log"

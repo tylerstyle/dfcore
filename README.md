@@ -13,10 +13,15 @@ devices may be touched, and one tamper-evident record of what was done.
   the `DFNIX_LIVE` label; partitions and holders inherit that status.
 - **`sysfs`**: the physical disks a device, or the filesystem holding a path, is
   stored on (partitions, device-mapper/md `slaves`, loop backing files, mountinfo for
-  btrfs/overlay). Used to refuse writing an image onto the disk being acquired.
+  btrfs/overlay). Used to refuse writing an image onto the disk being acquired. Also
+  device numbers of nodes, `diskseq`, `holders` and the `ro` flag.
 - **`protected`**: registry of system disks and the live medium, written at boot to
   `/run/dfnix/protected.json` by `dfcore-protect`. Entries match by WWN or serial, so
-  protection follows the disk across re-enumeration, not the kernel name.
+  protection follows the disk across re-enumeration, not the kernel name. A queried
+  node is found by path and by device number (`/dev/dm-N`, `/dev/disk/by-*`), and a
+  block device lsblk does not list is refused.
+- **`Refusal`**: every policy refusal carries this type in its error chain;
+  `dfcore::is_refusal(&err)` tells it from I/O and parse errors.
 - **`audit`**: append-only JSONL log (`/run/dfnix/audit.jsonl`), one record per tool
   action with time, boot ID, host, kernel, dfnix revision, tool version, uid, argv,
   device identity, outcome and details. Each record holds the SHA-256 of its
