@@ -21,7 +21,9 @@ devices may be touched, and one tamper-evident record of what was done.
   action with time, boot ID, host, kernel, dfnix revision, tool version, uid, argv,
   device identity, outcome and details. Each record holds the SHA-256 of its
   predecessor and of its own canonical encoding; appends are serialized with `flock`
-  and mirrored to the systemd journal (`SYSLOG_IDENTIFIER=dfnix-audit`).
+  and mirrored to the systemd journal (`SYSLOG_IDENTIFIER=dfnix-audit`). A log
+  redirected with `DFNIX_AUDIT_LOG` is not mirrored unless `DFNIX_AUDIT_JOURNAL=1`;
+  `DFNIX_AUDIT_JOURNAL=0` turns the mirror off.
 - **`release`**: `DFNIX_REVISION` from `/etc/dfnix-release`.
 
 ## Tamper evidence and its limit
@@ -37,6 +39,13 @@ dfcore-protect --print                 # (re)write /run/dfnix/protected.json
 dfcore-audit verify                    # OK: 42 records, head 3f…
 dfcore-audit export /media/target/case01
 ```
+
+`export` writes `audit-<boot_id>.jsonl` and `audit-<boot_id>.head`. The live log
+starts afresh at every boot, so each boot keeps its own copy in the case directory.
+Within a boot an export replaces the copy only with a longer state of the same log
+(the old bytes must be a prefix of the new); anything else goes to the next free
+`audit-<boot_id>-<n>.jsonl`. Files are written to a temporary name, synced and
+renamed; names are valid on exFAT, FAT and NTFS.
 
 Paths can be redirected with `DFNIX_PROTECTED_FILE`, `DFNIX_AUDIT_LOG` and
 `DFNIX_RELEASE_FILE`.

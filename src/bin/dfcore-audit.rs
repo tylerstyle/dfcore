@@ -3,6 +3,8 @@
 //!   dfcore-audit verify [LOG]        check the whole chain; exit 1 if it is broken
 //!   dfcore-audit head [LOG]          print the chain head (hash of the last record)
 //!   dfcore-audit export DIR [LOG]    copy the log and its head into a case directory
+//!                                    (audit-<boot_id>.jsonl / .head; never overwrites
+//!                                    another boot's copy)
 
 use anyhow::{bail, Result};
 use dfcore::audit;
@@ -21,10 +23,13 @@ fn main() -> Result<()> {
             let Some(dir) = args.get(1) else {
                 bail!("export needs a directory");
             };
-            let state = audit::export(&log(2), &PathBuf::from(dir))?;
+            let info = audit::export(&log(2), &PathBuf::from(dir))?;
             println!(
-                "Exported {} records to {dir}, head {}",
-                state.records, state.head
+                "Exported {} records to {}, head {} ({})",
+                info.state.records,
+                info.jsonl.display(),
+                info.state.head,
+                info.head.display()
             );
         }
         _ => bail!("Usage: dfcore-audit verify [LOG] | head [LOG] | export DIR [LOG]"),

@@ -234,15 +234,32 @@ pub fn verify_str(content: &str) -> Result<ChainState> {
     })
 }
 
+fn verify_bytes(content: &[u8]) -> Result<ChainState> {
+    verify_str(std::str::from_utf8(content).context("audit log is not valid UTF-8")?)
+}
+
+/// Verify the log at `path`; a missing log is an empty chain.
 pub fn verify(path: &Path) -> Result<ChainState> {
-    match std::fs::read_to_string(path) {
-        Ok(content) => verify_str(&content),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ChainState {
-            records: 0,
-            head: GENESIS.into(),
-        }),
-        Err(e) => Err(e).with_context(|| format!("Cannot read {}", path.display())),
-    }
+    verify_bytes(&read_log(path)?)
+}
+
+/// The log's bytes, read under a shared lock so that an append in progress is
+/// wholly in or wholly out. A missing log reads as empty. The lock is best
+/// effort: a filesystem that cannot lock still gets read, and a torn last
+/// line would fail verification rather than pass.
+fn read_log(path: &Path) -> Result<Vec<u8>> {
+    use std::os::unix::io::AsRawFd;
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("Cannot read {}", path.display())),
+    };
+    // SAFETY: flock on a file descriptor we own; released when `file` is dropped
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
+    let mut content = Vec::new();
+    file.read_to_end(&mut content)
+        .with_context(|| format!("Cannot read {}", path.display()))?;
+    Ok(content)
 }
 
 /// Append one event to the log at `path`, holding an exclusive lock so concurrent
@@ -350,19 +367,171 @@ fn send_to_journal(record: &Record, line: &str) {
     }
 }
 
-/// Copy the log next to case files and record its head, so the case directory
-/// carries its own anchor.
-pub fn export(log: &Path, dir: &Path) -> Result<ChainState> {
-    let state = verify(log)?;
-    std::fs::create_dir_all(dir)?;
-    if log.exists() {
-        std::fs::copy(log, dir.join("audit.jsonl"))?;
-    }
-    std::fs::write(
-        dir.join("audit.head"),
-        format!("{}  records={}\n", state.head, state.records),
+/// Boot ID in export file names when the kernel does not report one.
+pub const UNKNOWN_BOOT: &str = "unknown-boot";
+
+/// Highest `<n>` in `audit-<boot_id>-<n>.jsonl` that [`export`] tries.
+const MAX_EXPORTS: u32 = 9999;
+
+/// Where [`export`] put the copy of the log and its head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportInfo {
+    pub jsonl: PathBuf,
+    pub head: PathBuf,
+    pub state: ChainState,
+}
+
+/// Copy the log into a case directory as `audit-<boot_id>.jsonl`, with its head
+/// in `audit-<boot_id>.head`, so the case directory carries its own anchor.
+///
+/// The log under /run starts afresh at every boot of the live system, so each
+/// boot gets its own file and a later boot never replaces an earlier boot's
+/// chain. Within a boot the log only grows: an existing copy whose bytes are a
+/// prefix of the log is replaced by the longer one. Any other file is left
+/// alone and the copy goes to the next free `audit-<boot_id>-<n>.jsonl`.
+/// Files are written under a temporary name, synced and renamed into place.
+/// Names hold no ':' and nothing is linked, for exFAT, FAT and NTFS case drives.
+pub fn export(log: &Path, dir: &Path) -> Result<ExportInfo> {
+    let boot_id = host::boot_id().unwrap_or_else(|| UNKNOWN_BOOT.to_string());
+    export_for_boot(log, dir, &boot_id)
+}
+
+/// [`export`] under the given boot ID.
+pub fn export_for_boot(log: &Path, dir: &Path, boot_id: &str) -> Result<ExportInfo> {
+    let content = read_log(log)?;
+    let state = verify_bytes(&content).with_context(|| {
+        format!(
+            "Audit log {} failed verification; not exporting",
+            log.display()
+        )
+    })?;
+    std::fs::create_dir_all(dir).with_context(|| format!("Cannot create {}", dir.display()))?;
+    // Exports into one directory take turns choosing a name and writing
+    let _lock = lock_dir(dir);
+    let stem = export_stem(dir, &file_name_safe(boot_id), &content)?;
+    let jsonl = dir.join(format!("{stem}.jsonl"));
+    let head = dir.join(format!("{stem}.head"));
+    // Same permissions as the log itself; the head is no secret
+    write_atomic(&jsonl, &content, 0o600)?;
+    write_atomic(
+        &head,
+        format!("{}  records={}\n", state.head, state.records).as_bytes(),
+        0o644,
     )?;
-    Ok(state)
+    Ok(ExportInfo { jsonl, head, state })
+}
+
+/// ASCII letters, digits, '-' and '_' kept, anything else replaced by '_'.
+fn file_name_safe(s: &str) -> String {
+    let safe: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if safe.is_empty() {
+        UNKNOWN_BOOT.to_string()
+    } else {
+        safe
+    }
+}
+
+/// The first of `audit-<boot>`, `audit-<boot>-2`, … whose `.jsonl` is absent or
+/// an earlier state of `content` (a prefix of it). A `.head` whose `.jsonl` is
+/// gone still takes the name: an existing file is only ever replaced by a
+/// superset of itself.
+fn export_stem(dir: &Path, boot: &str, content: &[u8]) -> Result<String> {
+    for n in 1..=MAX_EXPORTS {
+        let stem = if n == 1 {
+            format!("audit-{boot}")
+        } else {
+            format!("audit-{boot}-{n}")
+        };
+        let jsonl = dir.join(format!("{stem}.jsonl"));
+        match std::fs::read(&jsonl) {
+            Ok(existing) if content.starts_with(&existing) => return Ok(stem),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let head = dir.join(format!("{stem}.head"));
+                if std::fs::symlink_metadata(head).is_err() {
+                    return Ok(stem);
+                }
+            }
+            Err(e) => return Err(e).with_context(|| format!("Cannot read {}", jsonl.display())),
+        }
+    }
+    bail!(
+        "No free audit export name for boot {boot} in {}",
+        dir.display()
+    )
+}
+
+/// Hold an exclusive lock on a directory until the returned handle is dropped.
+/// Best effort: some filesystems cannot lock, and exporting must still work.
+fn lock_dir(dir: &Path) -> Option<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let handle = std::fs::File::open(dir).ok()?;
+    // SAFETY: flock on a file descriptor we own; released when `handle` is dropped
+    (unsafe { libc::flock(handle.as_raw_fd(), libc::LOCK_EX) } == 0).then_some(handle)
+}
+
+/// Replace `path` by a temporary file in the same directory that is written,
+/// synced and renamed over it, then sync the directory: readers and a power
+/// cut see the old file or the new one, never a mix.
+fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("{} has no file name", path.display()))?;
+    let tmp = dir.join(format!(
+        ".{}.{}-{}.tmp",
+        name.to_string_lossy(),
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = (|| -> std::io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("Cannot write {}", path.display()));
+    }
+    sync_dir(dir)
+}
+
+fn sync_dir(dir: &Path) -> Result<()> {
+    match std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+        Ok(()) => Ok(()),
+        // Some FUSE and network filesystems cannot sync a directory
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::EINVAL | libc::ENOTSUP | libc::ENOSYS)
+            ) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| format!("Cannot sync {}", dir.display())),
+    }
 }
 
 #[cfg(test)]
@@ -510,12 +679,200 @@ mod tests {
         assert!(rec.ts.ends_with('Z'));
         assert_eq!(rec.details["ro_before"], Value::Bool(true));
         assert!(!rec.argv.is_empty());
-        let out = log.parent().unwrap().join("case");
-        let state = export(&log, &out).unwrap();
-        assert_eq!(state.records, 1);
-        assert!(std::fs::read_to_string(out.join("audit.head"))
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
-            .starts_with(&state.head));
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn read(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn export_keeps_one_copy_per_boot_and_grows_it_within_the_boot() {
+        let log = temp_log("export_boots");
+        let case = log.parent().unwrap().join("case");
+        append_to(&log, sample(0)).unwrap();
+        append_to(&log, sample(1)).unwrap();
+
+        let first = export_for_boot(&log, &case, "boot-a").unwrap();
+        assert_eq!(first.jsonl, case.join("audit-boot-a.jsonl"));
+        assert_eq!(first.head, case.join("audit-boot-a.head"));
+        assert_eq!(first.state.records, 2);
+        assert_eq!(read(&first.jsonl), read(&log));
+        assert_eq!(
+            read(&first.head),
+            format!("{}  records=2\n", first.state.head)
+        );
+
+        // Later in the same boot: the same file, now with every record
+        append_to(&log, sample(2)).unwrap();
+        let again = export_for_boot(&log, &case, "boot-a").unwrap();
+        assert_eq!(again.jsonl, first.jsonl);
+        assert_eq!(again.state.records, 3);
+        assert_eq!(read(&again.jsonl), read(&log));
+        let boot_a = read(&again.jsonl);
+
+        // After a reboot the live log starts again from genesis
+        std::fs::remove_file(&log).unwrap();
+        append_to(&log, sample(9)).unwrap();
+        let next_boot = export_for_boot(&log, &case, "boot-b").unwrap();
+        assert_eq!(next_boot.jsonl, case.join("audit-boot-b.jsonl"));
+        assert_eq!(next_boot.state.records, 1);
+        assert_eq!(read(&case.join("audit-boot-a.jsonl")), boot_a);
+        assert_eq!(
+            files_in(&case),
+            [
+                "audit-boot-a.head",
+                "audit-boot-a.jsonl",
+                "audit-boot-b.head",
+                "audit-boot-b.jsonl"
+            ]
+        );
+        assert_eq!(
+            verify(&case.join("audit-boot-a.jsonl")).unwrap(),
+            again.state
+        );
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
+    #[test]
+    fn export_never_overwrites_a_copy_that_is_not_an_earlier_state_of_the_log() {
+        let log = temp_log("export_numbered");
+        let base = log.parent().unwrap().to_path_buf();
+        let case = base.join("case");
+        append_to(&log, sample(0)).unwrap();
+        append_to(&log, sample(1)).unwrap();
+        let original = export_for_boot(&log, &case, "b").unwrap();
+        let kept = read(&original.jsonl);
+        // Files of dfcore 0.1 and of other tools stay untouched
+        std::fs::write(case.join("audit.jsonl"), "legacy\n").unwrap();
+        std::fs::write(case.join("audit.head"), "legacy\n").unwrap();
+
+        // Another chain under the same boot ID (log restarted or replaced)
+        let other = base.join("other.jsonl");
+        append_to(&other, sample(5)).unwrap();
+        let second = export_for_boot(&other, &case, "b").unwrap();
+        assert_eq!(second.jsonl, case.join("audit-b-2.jsonl"));
+        assert_eq!(second.head, case.join("audit-b-2.head"));
+        assert_eq!(read(&original.jsonl), kept);
+
+        // That chain grows: its own copy is replaced, not the first one
+        append_to(&other, sample(6)).unwrap();
+        let grown = export_for_boot(&other, &case, "b").unwrap();
+        assert_eq!(grown.jsonl, second.jsonl);
+        assert_eq!(grown.state.records, 2);
+
+        // The first chain grows too: back to its own file
+        append_to(&log, sample(2)).unwrap();
+        assert_eq!(
+            export_for_boot(&log, &case, "b").unwrap().jsonl,
+            original.jsonl
+        );
+
+        // A third chain takes the next free number
+        let third = base.join("third.jsonl");
+        append_to(&third, sample(7)).unwrap();
+        assert_eq!(
+            export_for_boot(&third, &case, "b").unwrap().jsonl,
+            case.join("audit-b-3.jsonl")
+        );
+
+        // A head left without its log keeps its name too
+        std::fs::write(case.join("audit-c.head"), "kept\n").unwrap();
+        let orphan = export_for_boot(&log, &case, "c").unwrap();
+        assert_eq!(orphan.jsonl, case.join("audit-c-2.jsonl"));
+        assert_eq!(read(&case.join("audit-c.head")), "kept\n");
+
+        assert_eq!(read(&case.join("audit.jsonl")), "legacy\n");
+        assert_eq!(read(&case.join("audit.head")), "legacy\n");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn export_writes_through_temporary_files_and_leaves_none_behind() {
+        let log = temp_log("export_atomic");
+        let base = log.parent().unwrap().to_path_buf();
+        let case = base.join("case");
+        for i in 0..3 {
+            append_to(&log, sample(i)).unwrap();
+        }
+        // Concurrent exports of one log into one directory
+        let handles: Vec<_> = (0..6)
+            .map(|_| {
+                let (log, case) = (log.clone(), case.clone());
+                std::thread::spawn(move || export_for_boot(&log, &case, "b").unwrap())
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().unwrap().jsonl, case.join("audit-b.jsonl"));
+        }
+        assert_eq!(files_in(&case), ["audit-b.head", "audit-b.jsonl"]);
+        assert_eq!(read(&case.join("audit-b.jsonl")), read(&log));
+
+        // A failed write leaves the target as it was and no temporary file
+        let target = case.join("audit-b.jsonl");
+        let blocked = case.join("blocked");
+        std::fs::create_dir_all(blocked.join("not-empty")).unwrap();
+        assert!(write_atomic(&blocked, b"new", 0o600).is_err());
+        assert!(blocked.join("not-empty").is_dir());
+        assert_eq!(
+            files_in(&case),
+            ["audit-b.head", "audit-b.jsonl", "blocked"]
+        );
+        write_atomic(&target, b"replaced\n", 0o600).unwrap();
+        assert_eq!(read(&target), "replaced\n");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn export_names_files_by_the_running_boot() {
+        let log = temp_log("export_boot_id");
+        let case = log.parent().unwrap().join("case");
+        append_to(&log, sample(0)).unwrap();
+        let info = export(&log, &case).unwrap();
+        let boot = host::boot_id().unwrap_or_else(|| UNKNOWN_BOOT.into());
+        assert_eq!(
+            info.jsonl,
+            case.join(format!("audit-{}.jsonl", file_name_safe(&boot)))
+        );
+        // Boot IDs only ever become portable file names
+        assert_eq!(file_name_safe("0b9f-4c:1/x y"), "0b9f-4c_1_x_y");
+        assert_eq!(file_name_safe(""), UNKNOWN_BOOT);
+        let odd = export_for_boot(&log, &case, "a:b/../c").unwrap();
+        assert_eq!(odd.jsonl, case.join("audit-a_b____c.jsonl"));
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
+    #[test]
+    fn export_of_a_missing_or_broken_log() {
+        let log = temp_log("export_missing");
+        let case = log.parent().unwrap().join("case");
+        // Nothing logged yet: an empty copy anchored at genesis
+        let empty = export_for_boot(&log, &case, "b").unwrap();
+        assert_eq!(empty.state.records, 0);
+        assert_eq!(read(&empty.jsonl), "");
+        assert!(read(&empty.head).starts_with(GENESIS));
+        // An empty copy is an earlier state of every log
+        append_to(&log, sample(0)).unwrap();
+        let filled = export_for_boot(&log, &case, "b").unwrap();
+        assert_eq!(filled.jsonl, empty.jsonl);
+        assert_eq!(filled.state.records, 1);
+
+        // A log that fails verification is not exported anywhere
+        let content = read(&log).replace("WD-EVID001", "FORGED");
+        std::fs::write(&log, content).unwrap();
+        let elsewhere = log.parent().unwrap().join("case2");
+        let e = export_for_boot(&log, &elsewhere, "b").unwrap_err();
+        assert!(format!("{e:#}").contains("failed verification"), "{e:#}");
+        assert!(!elsewhere.exists());
         let _ = std::fs::remove_dir_all(log.parent().unwrap());
     }
 
