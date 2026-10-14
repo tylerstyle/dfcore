@@ -278,10 +278,25 @@ pub fn descendants<'a>(
     flat.iter().filter(move |f| f.ancestors.contains(&path))
 }
 
+/// Every entry that is the device at `path`: listed under that path or, given
+/// the device number of the node at `path`, with that `MAJ:MIN`. The number
+/// finds a device reached through another name, such as `/dev/dm-3` for what
+/// lsblk lists as `/dev/mapper/cryptroot`, or a `/dev/disk/by-id` link.
+pub fn lookup<'a>(flat: &'a [FlatDevice], path: &str, dev: Option<DevNum>) -> Vec<&'a FlatDevice> {
+    flat.iter()
+        .filter(|f| f.device.dev_path() == path || (dev.is_some() && f.device.dev_num() == dev))
+        .collect()
+}
+
 /// The whole-disk entries (level 0) every entry for `path` sits on.
 pub fn roots<'a>(flat: &'a [FlatDevice], path: &str) -> Vec<&'a FlatDevice> {
+    roots_of(flat, &lookup(flat, path, None))
+}
+
+/// The whole-disk entries (level 0) the given entries sit on.
+pub fn roots_of<'a>(flat: &'a [FlatDevice], entries: &[&FlatDevice]) -> Vec<&'a FlatDevice> {
     let mut roots: Vec<&FlatDevice> = Vec::new();
-    for hit in flat.iter().filter(|f| f.device.dev_path() == path) {
+    for hit in entries {
         let root = hit.root_path();
         if let Some(r) = flat
             .iter()
@@ -372,6 +387,24 @@ pub(crate) mod tests {
         let roots = roots(&flat, "/dev/mapper/cryptroot");
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].device.name, "nvme0n1");
+    }
+
+    #[test]
+    fn lookup_by_path_or_device_number() {
+        let flat = lab();
+        let names =
+            |v: Vec<&FlatDevice>| v.iter().map(|f| f.device.name.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            names(lookup(&flat, "/dev/mapper/cryptroot", None)),
+            ["cryptroot"]
+        );
+        // The kernel name of the same node is not listed by lsblk
+        assert!(lookup(&flat, "/dev/dm-0", None).is_empty());
+        let hits = lookup(&flat, "/dev/dm-0", Some((254, 0)));
+        assert_eq!(names(hits.clone()), ["cryptroot"]);
+        assert_eq!(names(roots_of(&flat, &hits)), ["nvme0n1"]);
+        assert!(lookup(&flat, "/dev/sdz", Some((8, 200))).is_empty());
+        assert_eq!(flat[0].device.dev_num(), Some((259, 0)));
     }
 
     #[test]
