@@ -4,10 +4,12 @@
 //! their backing file. Filesystems with anonymous device numbers (btrfs, overlay)
 //! are resolved through `/proc/self/mountinfo`.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use crate::Refusal;
 
 /// A block device as the kernel numbers it.
 pub type DevNum = (u32, u32);
@@ -207,6 +209,7 @@ pub fn source_device(_path: &Path) -> Option<DevNum> {
 }
 
 /// Core of the destination-on-source check, separated from the host for tests.
+/// Every refusal, including a device that cannot be resolved, is a [`Refusal`].
 pub fn check_disjoint(
     topo: &BlockTopology,
     source: DevNum,
@@ -219,25 +222,24 @@ pub fn check_disjoint(
         return Ok(());
     };
     if dest == source {
-        bail!(
+        return Err(Refusal(format!(
             "Critical Safety Error: destination {} is stored on the source device {} itself!",
-            dest_label,
-            source_label
-        );
+            dest_label, source_label
+        ))
+        .into());
     }
+    // Fail closed: a device sysfs does not know cannot be shown to be disjoint
     let src_name = topo.name_of(source).ok_or_else(|| {
-        anyhow!(
+        Refusal(format!(
             "Cannot resolve source {} in sysfs; refusing to acquire",
             source_label
-        )
+        ))
     })?;
     let dst_name = topo.name_of(dest).ok_or_else(|| {
-        anyhow!(
+        Refusal(format!(
             "Cannot resolve the device holding {} ({}:{}) in sysfs; refusing to acquire",
-            dest_label,
-            dest.0,
-            dest.1
-        )
+            dest_label, dest.0, dest.1
+        ))
     })?;
     let src_disks = topo.backing_disks(&src_name);
     let dst_disks = topo.backing_disks(&dst_name);
@@ -245,7 +247,7 @@ pub fn check_disjoint(
     if shared.is_empty() {
         Ok(())
     } else {
-        Err(anyhow!(
+        Err(Refusal(format!(
             "Critical Safety Error: destination {} is on {} which shares physical disk {} with source {} ({}). Choose an output directory on a separate target drive.",
             dest_label,
             dst_name,
@@ -253,6 +255,7 @@ pub fn check_disjoint(
             source_label,
             src_name
         ))
+        .into())
     }
 }
 
@@ -376,30 +379,36 @@ mod tests {
     fn destination_on_source_tree_is_refused() {
         let s = FakeSys::lab("refused");
         let t = s.topo();
+        let refused = |src: DevNum, label: &str, dest: DevNum| {
+            let e = check_disjoint(&t, src, label, Some(dest), "/mnt/x").unwrap_err();
+            assert!(crate::is_refusal(&e), "{e:#}");
+            e.to_string()
+        };
         // Whole disk source, image written to one of its partitions
-        let e = check_disjoint(&t, (8, 16), "/dev/sdb", Some((8, 17)), "/mnt/x")
-            .unwrap_err()
-            .to_string();
+        let e = refused((8, 16), "/dev/sdb", (8, 17));
+        assert!(e.contains("Critical Safety Error"), "{e}");
         assert!(e.contains("shares physical disk sdb"), "{e}");
         // Partition source, image on a sibling partition
-        assert!(check_disjoint(&t, (8, 17), "/dev/sdb1", Some((8, 18)), "/mnt/x").is_err());
+        refused((8, 17), "/dev/sdb1", (8, 18));
         // Image on an LVM volume living on the source disk
-        assert!(check_disjoint(&t, (8, 16), "/dev/sdb", Some((254, 0)), "/mnt/x").is_err());
+        refused((8, 16), "/dev/sdb", (254, 0));
         // Image on a RAID array that has a member on the source disk
-        assert!(check_disjoint(&t, (8, 16), "/dev/sdb", Some((9, 0)), "/mnt/x").is_err());
+        refused((8, 16), "/dev/sdb", (9, 0));
         // Source is the array, image on a disk that is one of its members
-        assert!(check_disjoint(&t, (9, 0), "/dev/md0", Some((8, 33)), "/mnt/x").is_err());
+        refused((9, 0), "/dev/md0", (8, 33));
         // Same device outright
-        assert!(check_disjoint(&t, (8, 17), "/dev/sdb1", Some((8, 17)), "/mnt/x").is_err());
+        let e = refused((8, 17), "/dev/sdb1", (8, 17));
+        assert!(e.contains("Critical Safety Error"), "{e}");
     }
 
     #[test]
-    fn unresolvable_destination_device_is_refused() {
+    fn unresolvable_source_or_destination_device_is_refused() {
         let s = FakeSys::lab("unresolved");
-        let e = check_disjoint(&s.topo(), (8, 16), "/dev/sdb", Some((8, 200)), "/mnt/x")
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("Cannot resolve"), "{e}");
+        for (src, dest) in [((8, 16), (8, 200)), ((8, 200), (8, 33))] {
+            let e = check_disjoint(&s.topo(), src, "/dev/sdb", Some(dest), "/mnt/x").unwrap_err();
+            assert!(crate::is_refusal(&e), "{e:#}");
+            assert!(e.to_string().contains("Cannot resolve"), "{e}");
+        }
     }
 
     #[test]

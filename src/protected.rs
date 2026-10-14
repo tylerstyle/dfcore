@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use crate::host;
 use crate::lsblk::{self, DeviceIdentity, FlatDevice, LIVE_LABEL};
+use crate::Refusal;
 
 pub const DEFAULT_PATH: &str = "/run/dfnix/protected.json";
 pub const SCHEMA: u32 = 1;
@@ -126,12 +127,13 @@ impl Registry {
 
 /// Check `path` against the registry at the default location. A missing
 /// registry is not an error: the tool's own system detection still applies.
+/// A protected device is refused with a [`Refusal`].
 pub fn check(flat: &[FlatDevice], device_path: &str) -> Result<()> {
     let registry_path = path();
     if let Some(reg) = Registry::load(&registry_path)? {
         if let Some(p) = reg.protecting(flat, device_path) {
-            anyhow::bail!(
-                "ABORT: {} is protected ({:?}, {}): {}",
+            return Err(Refusal(format!(
+                "ABORT: {} is protected by the dfnix registry ({:?} {}): {}",
                 device_path,
                 p.role,
                 p.identity
@@ -140,7 +142,8 @@ pub fn check(flat: &[FlatDevice], device_path: &str) -> Result<()> {
                     .or(p.identity.wwn.as_deref())
                     .unwrap_or(&p.identity.kernel_name),
                 p.reasons.join("; ")
-            );
+            ))
+            .into());
         }
     }
     Ok(())
