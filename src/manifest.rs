@@ -880,14 +880,25 @@ impl Collection {
     }
 
     /// Record what identifies the source once it is known, e.g. after
-    /// connecting: TLS certificates, server greeting and capabilities.
-    pub fn set_source_identity(&mut self, identity: Value) {
+    /// connecting: TLS certificates, server greeting and capabilities. Written
+    /// to the incomplete manifest at once, so an interrupted run keeps it.
+    pub fn set_source_identity(&mut self, identity: Value) -> Result<()> {
         self.manifest.header.source.identity = identity;
+        self.write_manifest()
     }
 
-    /// Record the source's clock once it is known (after connecting).
-    pub fn set_source_clock(&mut self, clock: SourceClock) {
+    /// Record the source's clock once it is known (after connecting); written
+    /// at once like [`set_source_identity`](Self::set_source_identity).
+    pub fn set_source_clock(&mut self, clock: SourceClock) -> Result<()> {
         self.manifest.header.clocks.source = Some(clock);
+        self.write_manifest()
+    }
+
+    fn write_manifest(&self) -> Result<()> {
+        write_atomic(
+            &self.dir.join(MANIFEST),
+            &serde_json::to_vec_pretty(&self.manifest)?,
+        )
     }
 
     /// Record a problem that is not tied to one item.
@@ -1219,6 +1230,7 @@ pub fn verify(dir: &Path) -> Result<VerifyReport> {
         ("acquired", totals.acquired, m.totals.acquired),
         ("out_of_scope", totals.out_of_scope, m.totals.out_of_scope),
         ("errors", totals.errors, m.totals.errors),
+        ("skipped", totals.skipped, m.totals.skipped),
         ("bytes", totals.bytes, m.totals.bytes),
     ] {
         if got != want {

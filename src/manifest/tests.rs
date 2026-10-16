@@ -255,6 +255,12 @@ fn collection_records_items_and_verifies() {
         json!({"remote": "198.51.100.7:993"}),
     ))
     .unwrap();
+    c.set_source_identity(json!({"tls": {"version": "TLSv1_3"}}))
+        .unwrap();
+    // Known to the incomplete manifest before the collection finishes
+    let on_disk: Manifest =
+        serde_json::from_slice(&std::fs::read(dir.join(MANIFEST)).unwrap()).unwrap();
+    assert_eq!(on_disk.header.source.identity["tls"]["version"], "TLSv1_3");
     c.set_source_clock(
         SourceClock::new(
             "2026-10-16T12:00:00Z",
@@ -262,7 +268,8 @@ fn collection_records_items_and_verifies() {
             1_792_152_003 * 1_000_000_000,
         )
         .unwrap(),
-    );
+    )
+    .unwrap();
     assert_eq!(c.add(acquired(&dir, "a.txt", b"alpha")).unwrap(), 1);
     // A name a spreadsheet would run as a formula, with a comma and a quote
     let mut tricky = acquired(&dir, "b.txt", b"beta");
