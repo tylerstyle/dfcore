@@ -4,12 +4,14 @@
 //! - [`sysfs`]: which physical disks a device or a path is ultimately stored on
 //! - [`protected`]: registry of devices that must never be written (`/run/dfnix/protected.json`)
 //! - [`audit`]: append-only, SHA-256 hash-chained JSONL audit log
+//! - [`manifest`]: records of a logical acquisition (items, scope, footprint, clocks)
 //! - [`release`]: the dfnix system revision a tool runs on
 //! - [`Refusal`]: the error type of every policy decision that refuses an operation
 
 pub mod audit;
 pub mod host;
 pub mod lsblk;
+pub mod manifest;
 pub mod protected;
 pub mod refusal;
 pub mod release;

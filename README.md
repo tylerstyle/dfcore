@@ -29,6 +29,20 @@ devices may be touched, and one tamper-evident record of what was done.
   and mirrored to the systemd journal (`SYSLOG_IDENTIFIER=dfnix-audit`). A log
   redirected with `DFNIX_AUDIT_LOG` is not mirrored unless `DFNIX_AUDIT_JOURNAL=1`;
   `DFNIX_AUDIT_JOURNAL=0` turns the mirror off.
+- **`manifest`**: the record of a logical acquisition (files, mail, cloud,
+  databases) in its directory:
+  - `manifest.json` holds case, source, method, scope, clocks and totals;
+  - `items.jsonl` holds one line per item, including the items the scope left
+    out and the ones that failed;
+  - `footprint.jsonl` holds what the source could see (connections, commands,
+    queries);
+  - `items.csv` is generated from the items as a court annex.
+
+  The scope (accounts, path patterns, a time window, the legal basis) is decided
+  before any bytes move. The finished manifest hashes the record files, and the
+  audit log anchors the manifest: `<action>_started` before any data,
+  `<action>_finished` with the manifest's SHA-256. Interrupted collections resume;
+  `manifest::verify` re-checks everything.
 - **`release`**: `DFNIX_REVISION` from `/etc/dfnix-release`.
 
 ## Tamper evidence and its limit
